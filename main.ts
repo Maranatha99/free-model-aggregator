@@ -8,11 +8,11 @@
 // so a translated stream always carries the provider's text whole and its usage counts exactly.
 //
 // ROUTING
-//   Candidates are ranked by rating_milli descending. A provider that refused a call on either of
-//   the last two requests is demoted below every rating gap (a refusal is usually a spent budget, a
-//   failure on its schedule, or an outage: trying it again first only spends another call), and
-//   among equal ratings the provider called least so far wins. A provider is never dropped for a
-//   refusal alone: a scheduled failure is one call, and the same provider serves the next request.
+//   Candidates are ranked by rating_milli descending. A provider is demoted below every rating
+//   gap only after two refusals in a row (an outage, or its budget spent): one refusal is usually
+//   a single call on its failure schedule, and the provider serves the next request. Among equal
+//   ratings the provider called least so far wins. A provider is never dropped for refusals alone:
+//   a scheduled failure is one call, and the same provider serves the next request.
 //   JSON-mode requests from an OpenAI client never go to an Anthropic-wire provider: that wire
 //   cannot carry response_format, so the provider would echo json_mode absent and the request would
 //   fail its wire check. Gemini carries it as responseMimeType, OpenAI as response_format.
@@ -105,8 +105,11 @@ let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
 /** Inference calls made to each provider so far, successes and refusals alike. */
 const callsByProvider = new Map<string, number>();
-/** The request numbers (1-based, in arrival order) on which each provider last refused a call. */
-const failedRequestsByProvider = new Map<string, number[]>();
+/** Refusals in a row per provider: a success resets it. Two in a row means the provider is dead
+ *  for now (an outage, or its budget spent), not one call on its failure schedule. */
+const consecutiveFailures = new Map<string, number>();
+/** The last request number through which each provider is demoted, after two refusals in a row. */
+const demoteThrough = new Map<string, number>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -147,10 +150,11 @@ interface Candidate {
 
 /**
  * Every free model that can serve one request, best first. The ranking is the quality table's
- * rating, with a provider that refused on either of the last two requests demoted below every
- * rating gap, and equal ratings broken by the fewest calls so far, then provider and model id.
- * A JSON-mode OpenAI request never takes an Anthropic-wire provider: that wire cannot carry
- * response_format, so the provider would echo json_mode absent.
+ * rating, with a provider demoted below every rating gap only after two refusals in a row (an
+ * outage, or its budget spent): one refusal is usually a single call on its failure schedule, and
+ * the provider serves the next request. Equal ratings break by the fewest calls so far, then
+ * provider and model id. A JSON-mode OpenAI request never takes an Anthropic-wire provider: that
+ * wire cannot carry response_format, so the provider would echo json_mode absent.
  */
 function candidatesFor(requires: Requirement, jsonWire: boolean): Candidate[] {
   const out: Candidate[] = [];
@@ -164,13 +168,8 @@ function candidatesFor(requires: Requirement, jsonWire: boolean): Candidate[] {
       out.push({ probe, model, rating: row?.rating_milli ?? 0 });
     }
   }
-  const failed = failedRequestsByProvider;
-  const current = manifestIndex;
   out.sort((a, b) => {
-    const penalty = (c: Candidate): number => {
-      const last = failed.get(c.probe.provider.id) ?? [];
-      return last.some((n) => current - n <= 2) ? RECENT_FAILURE_PENALTY : 0;
-    };
+    const penalty = (c: Candidate): number => ((demoteThrough.get(c.probe.provider.id) ?? 0) >= manifestIndex ? RECENT_FAILURE_PENALTY : 0);
     const scoreA = a.rating - penalty(a);
     const scoreB = b.rating - penalty(b);
     if (scoreA !== scoreB) return scoreB - scoreA;
@@ -334,11 +333,20 @@ async function callCandidate(candidate: Candidate, api: 'openai' | 'anthropic', 
   return answer;
 }
 
-/** Record that a provider refused a call on this request, for the ranking's demotion. */
+/**
+ * Record that a provider refused a call on this request. One refusal is a scheduled failure and
+ * changes nothing; the second in a row demotes the provider for the next two requests, so a dead
+ * provider is not retried first on every request while it is out.
+ */
 function noteFailure(providerId: string): void {
-  const list = failedRequestsByProvider.get(providerId) ?? [];
-  list.push(manifestIndex);
-  failedRequestsByProvider.set(providerId, list);
+  const consecutive = (consecutiveFailures.get(providerId) ?? 0) + 1;
+  consecutiveFailures.set(providerId, consecutive);
+  if (consecutive >= 2) demoteThrough.set(providerId, manifestIndex + 2);
+}
+
+/** Record that a provider answered a call: its refusal streak ends. */
+function noteSuccess(providerId: string): void {
+  consecutiveFailures.set(providerId, 0);
 }
 
 /**
@@ -362,6 +370,7 @@ async function serve(api: 'openai' | 'anthropic', body: Json, res: ServerRespons
       noteFailure(candidate.probe.provider.id);
       continue;
     }
+    noteSuccess(candidate.probe.provider.id);
     const usage =
       answer.inputTokens >= 0 && answer.outputTokens >= 0
         ? { input: answer.inputTokens, output: answer.outputTokens }
