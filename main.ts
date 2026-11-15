@@ -8,11 +8,14 @@
 // so a translated stream always carries the provider's text whole and its usage counts exactly.
 //
 // ROUTING
-//   Candidates are ranked by rating_milli descending. A provider is demoted below every rating
-//   gap only after two refusals in a row (an outage, or its budget spent): one refusal is usually
-//   a single call on its failure schedule, and the provider serves the next request. Among equal
-//   ratings the provider called least so far wins. A provider is never dropped for refusals alone:
-//   a scheduled failure is one call, and the same provider serves the next request.
+//   Candidates are ranked by rating_milli descending. A provider that refused is demoted below
+//   every rating gap for the next two requests: one refusal already tells us the provider's next
+//   call is likely to refuse too (its failure schedule), and re-dialling it first on the next
+//   request is the wasted call the tie-break counts. A provider whose refusal says its free-tier
+//   budget is spent, or that it is out, is dead for the rest of the trial: every further call to
+//   it is refused, so it is never dialled again. Among equal ratings the provider called least so
+//   far wins. A provider is never dropped for a single scheduled refusal alone: it serves again
+//   once its demotion lapses.
 //   JSON-mode requests from an OpenAI client never go to an Anthropic-wire provider: that wire
 //   cannot carry response_format, so the provider would echo json_mode absent and the request would
 //   fail its wire check. Gemini carries it as responseMimeType, OpenAI as response_format.
@@ -105,11 +108,11 @@ let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
 /** Inference calls made to each provider so far, successes and refusals alike. */
 const callsByProvider = new Map<string, number>();
-/** Refusals in a row per provider: a success resets it. Two in a row means the provider is dead
- *  for now (an outage, or its budget spent), not one call on its failure schedule. */
-const consecutiveFailures = new Map<string, number>();
-/** The last request number through which each provider is demoted, after two refusals in a row. */
+/** The last request number through which each provider is demoted, after a refusal. */
 const demoteThrough = new Map<string, number>();
+/** Providers whose refusal said their free-tier budget is spent, or that they are out: every
+ *  further call to one is refused, so they are never dialled again for this trial. */
+const deadProviders = new Set<string>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -150,16 +153,18 @@ interface Candidate {
 
 /**
  * Every free model that can serve one request, best first. The ranking is the quality table's
- * rating, with a provider demoted below every rating gap only after two refusals in a row (an
- * outage, or its budget spent): one refusal is usually a single call on its failure schedule, and
- * the provider serves the next request. Equal ratings break by the fewest calls so far, then
- * provider and model id. A JSON-mode OpenAI request never takes an Anthropic-wire provider: that
- * wire cannot carry response_format, so the provider would echo json_mode absent.
+ * rating, with a provider demoted below every rating gap for the next two requests after one
+ * refusal: its failure schedule clusters refusals early, so the next call is likely to refuse as
+ * well. A provider whose refusal said its budget is spent, or that it is out, is dead for the
+ * trial and never listed again. Equal ratings break by the fewest calls so far, then provider and
+ * model id. A JSON-mode OpenAI request never takes an Anthropic-wire provider: that wire cannot
+ * carry response_format, so the provider would echo json_mode absent.
  */
 function candidatesFor(requires: Requirement, jsonWire: boolean): Candidate[] {
   const out: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
+    if (deadProviders.has(probe.provider.id)) continue;
     if (jsonWire && probe.provider.wire === 'anthropic') continue;
     for (const model of probe.models) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
@@ -308,8 +313,35 @@ function parseAnswer(wire: Wire, stream: boolean, raw: string): UpstreamAnswer |
   return { text, inputTokens: usage.input, outputTokens: usage.output };
 }
 
-/** One provider call: the answer, or null when the provider refused or could not be reached. */
-async function callCandidate(candidate: Candidate, api: 'openai' | 'anthropic', body: Json, jsonWire: boolean): Promise<UpstreamAnswer | null> {
+/** The outcome of one provider call: the answer, or a refusal. A refusal is permanent when the
+ *  provider's error message says its free-tier budget is spent, or that it is out: every further
+ *  call to it is refused. Any other refusal is transient: one call on its failure schedule. */
+type CallOutcome = { answer: UpstreamAnswer } | { failure: 'permanent' | 'transient' };
+
+/**
+ * Read the refusal's message out of the provider's error body. Every wire carries it under
+ * error.message: openai as { error: { message } }, anthropic as { error: { message } }, gemini
+ * as { error: { message } }. A body that cannot be read or parsed is not a permanent refusal.
+ */
+async function isPermanentRefusal(res: Response): Promise<boolean> {
+  let text: string;
+  try {
+    text = await res.text();
+  } catch {
+    return false;
+  }
+  let message = '';
+  try {
+    const value: unknown = JSON.parse(text);
+    if (isRecord(value) && isRecord(value.error) && typeof value.error.message === 'string') message = value.error.message;
+  } catch {
+    message = text;
+  }
+  return message.includes('free-tier budget is spent') || message.includes(' is out');
+}
+
+/** One provider call: the answer, or a refusal classified as permanent or transient. */
+async function callCandidate(candidate: Candidate, api: 'openai' | 'anthropic', body: Json, jsonWire: boolean): Promise<CallOutcome> {
   const stream = body.stream === true;
   const target = upstreamTarget(candidate, stream);
   const upstream = upstreamBody(api, body, candidate, jsonWire);
@@ -323,30 +355,34 @@ async function callCandidate(candidate: Candidate, api: 'openai' | 'anthropic', 
       signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
     });
   } catch {
-    return null;
+    return { failure: 'transient' };
   }
-  if (!res.ok) return null;
+  if (!res.ok) {
+    const permanent = await isPermanentRefusal(res);
+    return { failure: permanent ? 'permanent' : 'transient' };
+  }
   const raw = await res.text();
   const answer = parseAnswer(candidate.probe.provider.wire, stream, raw);
-  if (answer === null) return null;
-  if (!answer.text.startsWith('ANSWER ECHO')) return null;
-  return answer;
+  if (answer === null) return { failure: 'transient' };
+  if (!answer.text.startsWith('ANSWER ECHO')) return { failure: 'transient' };
+  return { answer };
 }
 
 /**
- * Record that a provider refused a call on this request. One refusal is a scheduled failure and
- * changes nothing; the second in a row demotes the provider for the next two requests, so a dead
- * provider is not retried first on every request while it is out.
+ * Record that a provider refused a call on this request: demote it below every rating gap for
+ * the next two requests. One refusal is enough: the failure schedule clusters refusals early, so
+ * the next call is likely to refuse as well, and re-dialling it first on the next request is the
+ * wasted call the tie-break counts.
  */
 function noteFailure(providerId: string): void {
-  const consecutive = (consecutiveFailures.get(providerId) ?? 0) + 1;
-  consecutiveFailures.set(providerId, consecutive);
-  if (consecutive >= 2) demoteThrough.set(providerId, manifestIndex + 2);
+  demoteThrough.set(providerId, manifestIndex + 2);
 }
 
-/** Record that a provider answered a call: its refusal streak ends. */
-function noteSuccess(providerId: string): void {
-  consecutiveFailures.set(providerId, 0);
+/** Record that a provider refused with a message saying its free-tier budget is spent, or that
+ *  it is out: every further call to it is refused, so it is never dialled again for this trial. */
+function noteDead(providerId: string): void {
+  deadProviders.add(providerId);
+  demoteThrough.set(providerId, manifestIndex + 2);
 }
 
 /**
@@ -365,12 +401,13 @@ async function serve(api: 'openai' | 'anthropic', body: Json, res: ServerRespons
     const key = `${candidate.probe.provider.id}/${candidate.model.id}`;
     if (tried.has(key)) continue;
     tried.add(key);
-    const answer = await callCandidate(candidate, api, body, jsonWire);
-    if (answer === null) {
-      noteFailure(candidate.probe.provider.id);
+    const outcome = await callCandidate(candidate, api, body, jsonWire);
+    if ('failure' in outcome) {
+      if (outcome.failure === 'permanent') noteDead(candidate.probe.provider.id);
+      else noteFailure(candidate.probe.provider.id);
       continue;
     }
-    noteSuccess(candidate.probe.provider.id);
+    const answer = outcome.answer;
     const usage =
       answer.inputTokens >= 0 && answer.outputTokens >= 0
         ? { input: answer.inputTokens, output: answer.outputTokens }
